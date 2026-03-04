@@ -1,0 +1,624 @@
+Below is a **Markdown version of the SDDD** (Software‑Driven Design Document) for your **Access → Power Platform** order number reservation system. It’s written to be **implementation-ready** (schema, flows, UX, security, ALM, Copilot playbook), and it reflects every decision we locked in during our Q\&A.
+
+***
+
+# SDDD — Order Number Reservation System (Access Replacement)
+
+**Platform:** Power Apps (Canvas) + Dataverse + Power Automate  
+**Owner:** Jay Samples  
+**Version:** 1.0 (Draft)  
+**Last Updated:** 2026‑03‑04
+
+***
+
+## 1. Purpose & Context
+
+### 1.1 Purpose
+
+Replace an existing Microsoft Access database used as the **system of record** for reserving unique order numbers to be entered into the ERP system. The solution must prevent duplicates, support batch generation with preview/commit, handle backorders, and track key lifecycle events (billed/invoice/cancel/reactivate).
+
+### 1.2 Business Risk / Priority
+
+The primary risk is **duplicate order numbers** being entered into the ERP. Correctness > convenience.  
+**Never reuse** a number once issued (even if canceled). Gaps are acceptable; duplicates are not.
+
+### 1.3 Success Criteria
+
+*   ✅ No duplicate order numbers, even under concurrency
+*   ✅ Preview does **not** mutate counters or ledger
+*   ✅ Commit is **hard stop** (all-or-nothing) with **auto-retry**
+*   ✅ Backorders are tied to **a specific existing OrderNumber**
+*   ✅ Standard Users can do daily operations; Admins handle reactivation and corrections
+*   ✅ Phase 2 option to move allocator into a Dataverse Custom API/plugin without reworking schema/UI
+
+***
+
+## 2. Scope & Requirements
+
+### 2.1 In Scope (Phase 1)
+
+*   Generate order numbers in two scopes:
+    *   **SALES**: `BaseToken` numeric, **allocated at Commit** (not at screen entry)
+    *   **PROJECT**: `BaseToken` alphanumeric project code, user-selected and reusable over time
+*   Batch generation:
+    *   Multiple **QualifierCode** lines per batch (SALES and PROJECT)
+    *   One **SystemLetter** per batch (single selection)
+    *   Quantity per qualifier
+    *   Preview list before committing
+*   Backorder creation:
+    *   Always tied to a specific existing order record (root)
+    *   Backorder number increments per root (`00`, `01`, `02`, ...)
+*   Lifecycle updates:
+    *   Stamp billed date
+    *   Stamp invoice sent date
+    *   Cancel order (capture canceled by, reason, date)
+    *   Reactivate canceled order (Admin only)
+*   Customer selection from a maintained reference list (Dataverse import)
+
+### 2.2 Out of Scope (Phase 1)
+
+*   Live ERP integration (read/write)
+*   Automated customer sync (manual import is fine)
+*   Approvals / complex workflows
+*   Custom API/plugin (planned as Phase 2 hardening option)
+
+***
+
+## 3. Domain Rules (Authoritative)
+
+### 3.1 Order Number Format
+
+    <BaseToken>-<QualifierCode><SystemLetter><Seq>-<BackorderNo>
+
+Examples:
+
+*   SALES: `576001-CMN001-00`
+*   PROJECT: `TAGO25-CMN001-00`
+
+### 3.2 Components & Constraints
+
+*   **Scope:** `SALES` | `PROJECT`
+*   **BaseToken:**
+    *   SALES: numeric, **allocated at Commit**
+    *   PROJECT: alphanumeric project code, selected and reused over time
+*   **QualifierCode:** two alphanumeric characters (e.g., `CM`, `CF`, `YB`)
+*   **SystemLetter:** single character per batch (default `P` for SALES; editable)
+*   **Seq:**
+    *   starts at 001 per sequence stream
+    *   increments by 1 per allocation
+    *   sequence stream key:
+            (Scope, BaseToken, QualifierCode, SystemLetter)
+*   **BackorderNo:**
+    *   root record uses `00` (stored as 0)
+    *   backorders use `01`, `02`, ... per root record
+    *   **never reused**
+*   **Preview** is non-allocating
+*   **Commit** allocates and persists, with retry + hard stop
+
+### 3.3 Preview UX Contract (SALES)
+
+Preview shows a **candidate BaseToken** and fully formatted predicted order numbers, with disclaimer:
+
+> “Preview uses the next available base token at the time of preview. Final numbers are assigned at commit and may differ if another user commits first.”
+
+Commit returns the authoritative created list and BaseToken.
+
+***
+
+## 4. Architecture Overview
+
+### 4.1 Logical Architecture
+
+*   **Power Apps (Canvas):** end-user UI (batch generation, list, actions)
+*   **Dataverse:** system of record (ledger, counters, reference tables)
+*   **Power Automate:** server-side allocator + lifecycle transitions
+
+### 4.2 Design Principles (Non-Negotiable)
+
+*   Allocation runs **server-side** (flows in Phase 1)
+*   UI never computes sequences using Max()+1 or similar
+*   Preview never writes
+*   Commit has retry + hard stop
+*   Counters are never decremented
+*   Uniqueness constraints enforce no-duplicates even if logic fails
+
+***
+
+## 5. Data Model (Dataverse)
+
+> Use your solution publisher prefix; names below are conceptual.
+
+### 5.1 Table: `Customer` (Reference)
+
+**Purpose:** CustomerCode → CustomerName lookup (manual import)
+
+Fields:
+
+*   `CustomerId` (PK, GUID)
+*   `CustomerCode` (Text, Required, **Unique Alternate Key**)
+*   `CustomerName` (Text, Required)
+*   Optional:
+    *   `IsActive` (Yes/No)
+    *   `LastImportedOn` (DateTime)
+
+Notes:
+
+*   Ledger stores snapshot `CustomerCode` and `CustomerName` at time of allocation to preserve historical accuracy.
+
+***
+
+### 5.2 Table: `QualifierType` (Reference)
+
+Fields:
+
+*   `QualifierTypeId` (PK)
+*   `QualifierCode` (Text length 2, Required, **Unique Alternate Key**)
+*   `QualifierDescription` (Text, Required)
+*   Optional `IsActive` (Yes/No)
+
+***
+
+### 5.3 Table: `SalesBaseTokenCounter` (Allocator for SALES BaseToken)
+
+**Purpose:** Allocate numeric SALES BaseToken at commit time.
+
+Fields:
+
+*   `CounterId` (PK)
+*   `CounterName` (Text, Required, **Unique Alternate Key**) — constant `SALES_BASE`
+*   `NextBaseToken` (Whole Number, Required)
+*   `LastUpdated` (DateTime)
+
+Initialization:
+
+*   Set `NextBaseToken` to the next intended SALES base token (e.g., 576061).
+
+***
+
+### 5.4 Table: `OrderSequenceCounter` (Allocator for Seq)
+
+**Purpose:** Mirrors Access `OrderSeq`.
+
+Fields:
+
+*   `CounterId` (PK)
+*   `Scope` (Choice: SALES, PROJECT) (Required)
+*   `BaseToken` (Text) (Required)
+*   `QualifierCode` (Text length 2) (Required)
+*   `SystemLetter` (Text length 1) (Required)
+*   `NextSeq` (Whole Number) (Required; starts at 1)
+*   `LastUpdated` (DateTime)
+
+**Alternate Key (Unique):**
+
+*   `(Scope, BaseToken, QualifierCode, SystemLetter)`
+
+***
+
+### 5.5 Table: `AllocatedOrderNumber` (Ledger — System of Record)
+
+**Purpose:** One row per final OrderNumber, including backorders.
+
+Allocator identity (immutable after create):
+
+*   `Scope` (Choice) (Required)
+*   `BaseToken` (Text) (Required)
+*   `QualifierCode` (Text length 2) (Required)
+*   `SystemLetter` (Text length 1) (Required)
+*   `Seq` (Whole Number) (Required)
+*   `BackorderNo` (Whole Number) (Required; root=0)
+*   `OrderNumber` (Text) (Required; stored)
+*   `ParentOrder` (Lookup to `AllocatedOrderNumber`) (nullable; set for backorders)
+*   `BatchId` (Text GUID) (Required)
+
+Business context (required at create; **Admin-only editable post-commit**):
+
+*   `CustomerCode` (Text) (Required)
+*   `CustomerName` (Text) (Required)
+*   `PONumber` (Text) (Required)
+*   `DateReceived` (Date) (Required)
+
+Lifecycle:
+
+*   `ActiveFlag` (Yes/No) (Required; default Yes)
+*   `DateCreated` (DateTime)
+*   `DateBilled` (Date) (nullable)
+*   `DateInvoiceSent` (Date) (nullable)
+*   Cancel fields:
+    *   `DateCanceled` (Date) (nullable)
+    *   `CancelReason` (Text) (nullable)
+    *   `CanceledBy` (Text) (nullable)
+*   Reactivation fields (Admin only):
+    *   `DateReactivated` (Date) (nullable)
+    *   `ReactivatedBy` (Text) (nullable)
+
+**Alternate Key (Unique):**
+
+*   `(Scope, BaseToken, QualifierCode, SystemLetter, Seq, BackorderNo)`
+
+***
+
+## 6. Lifecycle & Status Model
+
+### 6.1 States / Milestones
+
+*   **Active**: valid allocated number (default)
+*   **Canceled**: ActiveFlag=false; number remains burned
+*   **Reactivated**: Admin restores ActiveFlag=true, cancellation metadata retained
+*   **Billed**: DateBilled set
+*   **Invoice Sent**: DateInvoiceSent set
+
+### 6.2 Allowed Transitions
+
+*   Create → Active
+*   Active → Canceled
+*   Canceled → Active (Admin only)
+*   Active → Billed (or billed anytime after creation)
+*   Active/Billed → Invoice Sent
+
+### 6.3 Immutability Rules
+
+After creation, no one edits allocator identity:
+
+*   Scope, BaseToken, QualifierCode, SystemLetter, Seq, BackorderNo, OrderNumber
+
+Admin-only post-commit corrections:
+
+*   CustomerCode, CustomerName, PONumber, DateReceived
+
+***
+
+## 7. Security Model (Roles)
+
+### 7.1 Roles
+
+**Standard User**
+
+*   Can: Preview, Commit batch, Create backorder, Stamp billed, Stamp invoice sent, Cancel order
+*   Cannot: Reactivate canceled orders; edit Customer/PO/DateReceived post-commit; edit counters; manage reference tables
+
+**Admin**
+
+*   Can: everything Standard User can do
+*   Plus: Reactivate canceled orders; correct Customer/PO/DateReceived; maintain Customer/Qualifier reference data
+
+### 7.2 Dataverse Permission Strategy (Phase 1)
+
+*   `AllocatedOrderNumber`
+    *   Standard: Create/Read; updates only through flows (or limited update perms)
+    *   Admin: Full
+*   Counters (`SalesBaseTokenCounter`, `OrderSequenceCounter`)
+    *   Standard: No direct access
+    *   Admin: Read (Update optional for emergency repair, usually not needed)
+*   References (`Customer`, `QualifierType`)
+    *   Standard: Read
+    *   Admin: Full
+
+***
+
+## 8. UX Specification (Canvas App)
+
+### 8.1 Screen Map
+
+1.  **Order List / Dashboard**
+    *   Search by OrderNumber, filter by date/customer/status
+    *   Actions on selected record:
+        *   Create Backorder
+        *   Stamp Billed
+        *   Stamp Invoice Sent
+        *   Cancel
+        *   (Admin) Reactivate
+        *   (Admin) Correct header fields
+
+2.  **New Order Type**
+    *   Buttons: SALES / PROJECT
+
+3.  **Batch Generate Orders**
+    Inputs:
+
+    *   Scope (fixed)
+    *   BaseToken:
+        *   SALES: candidate BaseToken shown on preview (read-only)
+        *   PROJECT: select project BaseToken
+    *   SystemLetter (default `P` for SALES; required)
+    *   Customer (required)
+    *   PO Number (required)
+    *   Date Received (default today; required)
+    *   Qualifier grid: quantities per QualifierCode
+
+    Actions:
+
+    *   Reset Qty
+    *   Preview Numbers
+    *   Commit Batch
+
+### 8.2 Preview/Commit UX Rules
+
+*   Preview shows candidate BaseToken + predicted numbers + disclaimer
+*   Commit returns actual created list + actual BaseToken
+*   After commit, show a results view and/or return to list filtered by BatchId
+
+***
+
+## 9. Automation Design (Power Automate)
+
+### 9.1 Flow Naming (Suggested)
+
+*   `SO.PreviewBatch`
+*   `SO.CommitBatch`
+*   `SO.CreateBackorder`
+*   `SO.StampBilled`
+*   `SO.StampInvoiceSent`
+*   `SO.CancelOrder`
+*   `SO.ReactivateOrder`
+*   (Optional) `REF.ImportCustomers`
+
+### 9.2 Retry Strategy (Commit & Backorder)
+
+*   Retry attempts: 5
+*   Backoff: exponential (1s, 2s, 4s, 8s, 16s)
+*   Hard stop (no partial records remaining for the batch)
+
+### 9.3 Flow: `SO.PreviewBatch`
+
+**Purpose:** Show estimated results, **no writes**
+
+Inputs:
+
+*   `Scope`
+*   `SystemLetter`
+*   `BaseToken` (required for PROJECT; omitted for SALES)
+*   `CustomerCode` (optional for preview validation)
+*   `QualifierRequests[]`: array of `{ QualifierCode, Quantity }`
+
+Outputs:
+
+*   `CandidateBaseToken`
+*   `PreviewOrderNumbers[]`
+
+Logic:
+
+*   SALES:
+    *   Read `SalesBaseTokenCounter.NextBaseToken` as candidate base
+*   PROJECT:
+    *   Use provided BaseToken
+*   For each qualifier:
+    *   Read counter if exists; else assume NextSeq=1
+*   Build numbers for each qualifier/qty using candidate base token and predicted sequences
+*   Return list + disclaimer
+
+### 9.4 Flow: `SO.CommitBatch` (Allocator)
+
+**Purpose:** Persist final allocations (ledger rows), allocate BaseToken (SALES), allocate sequences, apply retry + hard stop.
+
+Inputs:
+
+*   `Scope`
+*   For PROJECT: `BaseToken`
+*   `SystemLetter`
+*   `CustomerCode`, `CustomerName`, `PONumber`, `DateReceived`
+*   `QualifierRequests[]` of `{ QualifierCode, Quantity }`
+*   `BatchId` (GUID from app)
+
+Outputs:
+
+*   `AllocatedBaseToken`
+*   `CreatedOrderNumbers[]`
+*   `BatchId`
+
+Algorithm:
+
+1.  **Allocate BaseToken**
+    *   SALES:
+        *   Read `SalesBaseTokenCounter.NextBaseToken` → `AllocatedBaseToken`
+        *   Update `NextBaseToken = NextBaseToken + 1`
+    *   PROJECT:
+        *   Use provided BaseToken
+2.  **For each qualifier request where Quantity > 0**
+    *   Ensure `OrderSequenceCounter` exists for `(Scope, BaseToken, QualifierCode, SystemLetter)`
+        *   Create with NextSeq=1 if missing (handle create conflicts by re-read)
+    *   Read `NextSeq` → `StartSeq`
+    *   Compute `EndSeq = StartSeq + Quantity - 1`
+    *   Update counter to `NextSeq = EndSeq + 1`
+    *   Create `AllocatedOrderNumber` ledger rows:
+        *   Seq = StartSeq..EndSeq
+        *   BackorderNo = 0
+        *   ParentOrder = null
+        *   OrderNumber stored with formatting
+3.  **Retry on conflicts**
+4.  **Hard stop**
+    *   If failure after retries: delete any ledger rows created under BatchId
+    *   Do not decrement counters (numbers are burned)
+
+### 9.5 Flow: `SO.CreateBackorder`
+
+**Purpose:** Create a backorder tied to a specific root order record.
+
+Inputs:
+
+*   `RootOrderId`
+
+Outputs:
+
+*   `CreatedBackorderOrderNumber`
+
+Logic:
+
+*   Read root order record
+*   Determine next backorder:
+    *   Count existing children where ParentOrder = RootOrderId
+    *   nextBackorderNo = count + 1 (root is 0)
+*   Create new ledger row copying identity fields from root:
+    *   same Scope/BaseToken/QualifierCode/SystemLetter/Seq
+    *   BackorderNo = nextBackorderNo
+    *   ParentOrder = RootOrderId
+*   Return created OrderNumber
+
+### 9.6 Lifecycle Flows
+
+*   `SO.CancelOrder`: sets ActiveFlag=false + cancel metadata
+*   `SO.ReactivateOrder` (Admin only): sets ActiveFlag=true + reactivation metadata
+*   `SO.StampBilled`: sets DateBilled
+*   `SO.StampInvoiceSent`: sets DateInvoiceSent
+
+Validation:
+
+*   Record exists
+*   Transition allowed
+*   Identity fields never changed
+
+***
+
+## 10. Data Integrity Controls
+
+### 10.1 Unique Constraints
+
+*   Counters:
+    *   `OrderSequenceCounter` unique key prevents multiple stream counters
+    *   `SalesBaseTokenCounter` ensures single counter row
+*   Ledger:
+    *   `AllocatedOrderNumber` unique key prevents duplicates
+
+### 10.2 Never Reuse Policy
+
+*   Counters never decrement
+*   Cancel does not delete records
+*   Reactivation does not change identity
+*   Gaps allowed, duplicates prohibited
+
+### 10.3 Audit Events
+
+No additional event log table required (Dataverse CreatedOn/ModifiedOn is sufficient).
+
+***
+
+## 11. ALM & Environment Strategy
+
+### 11.1 Environments
+
+*   DEV → TEST/UAT → PROD
+
+### 11.2 Solutions
+
+*   Single solution containing:
+    *   Dataverse tables + keys
+    *   Canvas app
+    *   Power Automate flows
+    *   Security roles
+
+### 11.3 Configuration & Seed Data
+
+*   Seed QualifierType in DEV and deploy with solution
+*   Customer list imported per environment (manual import or import flow)
+
+***
+
+## 12. Migration Plan (Access → Dataverse)
+
+### 12.1 What to migrate
+
+*   Optional historical ledger (existing SalesOrders records)
+*   Initialize counters:
+    *   SalesBaseTokenCounter.NextBaseToken = next value after last used SALES base
+    *   Sequence counters can be initialized as needed; otherwise they will start at 1 per stream when first used
+*   Import Customers (from ERP extract)
+*   Import QualifierType list
+
+### 12.2 Validation Tests
+
+*   Allocate batch with multiple qualifiers
+*   Parallel commits from two users (concurrency test)
+*   Create multiple backorders on same root
+*   Cancel and reactivate
+*   Verify no duplicates possible by attempting intentional collisions
+
+***
+
+## 13. Copilot Playbook (Build Acceleration + Guardrails)
+
+### 13.1 Safe Uses
+
+*   Scaffold tables and relationships
+*   Generate Canvas UI layout
+*   Create Flow skeletons (triggers, inputs, responses)
+
+### 13.2 Unsafe Uses (Do Not Delegate)
+
+*   Allocator math
+*   Retry/hard-stop semantics
+*   Alternate keys / uniqueness constraints
+*   Backorder derivation rules
+
+### 13.3 Prompt Pack
+
+#### Prompt: Dataverse Schema Scaffolding
+
+```text
+Create Dataverse tables for an order number allocator:
+Customer(CustomerCode unique, CustomerName, IsActive, LastImportedOn),
+QualifierType(QualifierCode unique length 2, QualifierDescription, IsActive),
+SalesBaseTokenCounter(CounterName unique, NextBaseToken, LastUpdated),
+OrderSequenceCounter(Scope choice SALES/PROJECT, BaseToken, QualifierCode, SystemLetter, NextSeq, LastUpdated),
+AllocatedOrderNumber(Scope, BaseToken, QualifierCode, SystemLetter, Seq, BackorderNo, OrderNumber, ParentOrder lookup to AllocatedOrderNumber, BatchId, CustomerCode, CustomerName, PONumber, DateReceived, ActiveFlag, DateCreated, DateBilled, DateInvoiceSent, DateCanceled, CancelReason, CanceledBy, DateReactivated, ReactivatedBy).
+
+Do not invent allocation logic. Provide recommended data types, required flags, and note where alternate keys should be created.
+```
+
+#### Prompt: Canvas Screen Layout
+
+```text
+Generate a Canvas App with:
+- Order List screen with search/filter by OrderNumber, customer, date, status
+- New Order Type screen (Sales / Project)
+- Batch Generate screen with required Customer/PO/DateReceived/SystemLetter and a qualifier quantity grid
+- Preview button calling a flow and showing a disclaimer
+- Commit button calling a flow and showing created OrderNumbers
+
+Do not compute sequences in Power Apps. All allocation is performed by Power Automate.
+```
+
+#### Prompt: Flow Skeletons Only
+
+```text
+Create Power Automate flow skeletons with Power Apps trigger + Response action for:
+SO.PreviewBatch, SO.CommitBatch, SO.CreateBackorder, SO.CancelOrder, SO.ReactivateOrder, SO.StampBilled, SO.StampInvoiceSent.
+Include input parameter schemas and response payloads. Leave allocation logic as TODO placeholders.
+```
+
+***
+
+## 14. Phase 2 Hardening (Optional)
+
+If concurrency or governance needs increase:
+
+*   Replace allocator logic in `SO.CommitBatch` with Dataverse **Custom API/plugin** for true transactional allocation.
+*   Keep schema and app; swap engine behind the scenes.
+
+***
+
+# Appendix A — Formatting Rules
+
+*   Seq: 3 digits (`001`, `002`, …)
+*   BackorderNo: 2 digits (`00`, `01`, …)
+
+OrderNumber construction:
+
+    OrderNumber =
+      BaseToken & "-" &
+      QualifierCode & SystemLetter & Text(Seq, "000") & "-" &
+      Text(BackorderNo, "00")
+
+***
+
+# Appendix B — Major Business Events (for future logging if needed)
+
+*   Commit batch
+*   Create backorder
+*   Cancel order
+*   Reactivate order
+*   Stamp billed
+*   Stamp invoice sent
+
+***
+
+
