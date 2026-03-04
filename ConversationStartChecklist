@@ -1,0 +1,175 @@
+Perfect — this is the **last “meta” artifact you need** to make Copilot consistently useful without drifting, forgetting, or re‑architecting.
+
+Below is a **Start‑of‑Conversation Checklist** you can literally paste at the top of a new chat, followed by **how to use it**, and **variants** depending on what kind of work you’re doing.
+
+***
+
+# ✅ Start‑of‑Conversation Checklist (Copy/Paste)
+
+Use this at the **top of every new Copilot conversation** once the SDDD exists.
+
+```text
+START‑OF‑CONVERSATION CHECKLIST
+
+1. Project
+- Power Platform solution replacing an Access database
+- System of record for allocating unique Sales and Project order numbers
+
+2. Authoritative Design
+- An approved SDDD exists
+- Do NOT redesign architecture, numbering rules, or lifecycle unless explicitly asked
+
+3. Core Rules (Non‑Negotiable)
+- Dataverse is the system of record
+- Order numbers are never reused (even if canceled)
+- Preview is non‑allocating
+- Commit allocates with hard stop + retry
+- SALES BaseToken is allocated at Commit (not Preview)
+- Backorders are always tied to a specific existing OrderNumber
+- Allocation logic is server‑side (Power Automate in Phase 1)
+
+4. Key Tables
+- AllocatedOrderNumber (ledger; one row per final number)
+- OrderSequenceCounter (NextSeq per Scope/BaseToken/Qualifier/SystemLetter)
+- SalesBaseTokenCounter (Next SALES BaseToken)
+- Customer (Code → Name reference)
+- QualifierType (2‑char codes)
+
+5. Roles
+- Standard User: preview, commit, backorder, stamp, cancel
+- Admin: reactivate canceled orders, correct Customer/PO/DateReceived, manage reference data
+
+6. Guardrails
+- No Max()+1 logic
+- No client‑side sequence math
+- No counter decrements
+- Identity fields are immutable after creation
+
+7. Current Focus
+- I am working on: [USER STORY / TASK NAME]
+- Desired output: [steps / flow design / app changes / validation checklist]
+
+Operate strictly within this context.
+```
+
+✅ This is your **safe reset button**.
+
+***
+
+# 🧠 How to Use This Checklist (Best Practice)
+
+### ✅ Always do this
+
+*   Paste the checklist **first**
+*   Then immediately add:
+    *   **The specific User Story**
+    *   **What you want Copilot to produce**
+
+Example:
+
+```text
+[PASTE CHECKLIST]
+
+User Story: US‑009 Commit SALES Batch Allocation
+
+I want:
+- Power Automate flow step‑by‑step design
+- Retry and compensation logic
+- Inputs/outputs for Power Apps
+- Edge cases to test
+```
+
+This forces Copilot into **implementer mode**, not “solution brainstorm mode”.
+
+***
+
+## ❌ What not to do
+
+*   Don’t paste the entire SDDD again
+*   Don’t say “help me design…” unless you actually want redesign
+*   Don’t rely on Copilot to “remember” allocator rules without this checklist
+
+***
+
+# 🧩 Variants (Use These When Helpful)
+
+## Variant A — User Story Implementation Mode
+
+Use when you’re executing Trello cards.
+
+```text
+Additional constraints:
+- Treat the User Story as already approved
+- Break work into Dataverse / Power Automate / Canvas App sections
+- Call out acceptance criteria alignment
+```
+
+***
+
+## Variant B — Debugging Mode
+
+Use when something breaks and you want precision.
+
+```text
+Additional constraints:
+- Do not suggest architectural changes
+- Focus on why the current design could fail
+- Provide fixes consistent with the SDDD
+```
+
+***
+
+## Variant C — Copilot Scaffolding Mode
+
+Use when letting Copilot generate UI or schema **safely**.
+
+```text
+Additional constraints:
+- Generate scaffolding only
+- No allocator logic
+- No changes to keys or counters
+```
+
+***
+
+# 🔁 How Often to Switch Conversations (Concrete Guidance)
+
+You asked earlier — here is the **final, simple rule** you can actually follow:
+
+### ✅ Switch conversations when:
+
+*   You change **what you are building**
+    *   Architecture → User Stories
+    *   User Stories → Flows
+    *   Flows → Canvas App
+*   You complete **3–5 Trello cards**
+*   The conversation contains:
+    *   Long documents
+    *   Multiple pasted code blocks
+    *   Corrections like “no, that’s not how it works”
+
+### ⏱ Practical cadence
+
+*   **1 conversation per Epic**
+*   **1 conversation per 60–90 minutes of deep work**
+
+Every new conversation starts with the checklist.
+
+***
+
+# 🧭 Why This Works (Important Insight)
+
+What you’re doing here is treating Copilot like:
+
+> ✅ a **stateful assistant with a stateless memory**
+
+The checklist:
+
+*   Re‑hydrates state
+*   Prevents hallucination
+*   Locks Copilot into *execution mode*
+*   Makes results consistent across days/weeks
+
+This is exactly how senior teams use Copilot effectively on long‑running Power Platform builds.
+
+
