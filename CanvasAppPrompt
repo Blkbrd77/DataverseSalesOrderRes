@@ -1,0 +1,225 @@
+Below is a **ready‑to‑paste context‑carryover prompt** you can use to start a *new* Copilot conversation and instantly re‑establish **everything that matters so far**—architecture, tables, UI, and where execution stands.
+
+I’ve written this in the same **“locked‑context / implementation mode”** style you’ve been using, so the next session won’t drift or redesign.
+
+***
+
+## ✅ Context Carryover Prompt — Q‑1019 Order Allocation System
+
+**Mission & Scope (Locked)**  
+Project replaces a legacy Access database with a Power Platform solution.  
+Purpose is to act as the **system of record for allocating unique Sales and Project order numbers**.  
+An **approved SDDD exists**. Architecture, numbering rules, and lifecycle are **locked** unless explicitly requested.
+
+***
+
+### 1) Non‑Negotiable System Rules (Invariants)
+
+*   **Dataverse is the system of record** for all allocation identities and ledgers.
+*   **Order numbers are never reused**, including canceled orders.
+*   **Preview is non‑allocating**:
+    *   No counters touched
+    *   No ledger rows created
+*   **Commit allocates server‑side** (Phase 1 = Power Automate):
+    *   Hard stop + bounded retry under concurrency
+*   **SALES BaseToken is allocated only at Commit**, never at Preview.
+*   **Backorders** must link to an existing allocated order (parent self‑lookup).
+*   Allocation logic is **server‑side only**.
+*   Guardrails:
+    *   ❌ No `Max()+1`
+    *   ❌ No client‑side sequence math
+    *   ❌ No counter decrements
+    *   ✅ Identity fields immutable after creation (enforced server‑side)
+
+***
+
+### 2) Roles (Authority Boundaries)
+
+**Standard User**
+
+*   Preview
+*   Commit
+*   Backorder
+*   Stamp
+*   Cancel
+
+**Admin**
+
+*   Reactivate canceled orders
+*   Correct Customer / PO / DateReceived
+*   Manage reference data
+
+***
+
+### 3) Core Dataverse Tables (Contractual)
+
+#### A) `SalesBaseTokenCounter`
+
+*   Single authoritative source for **next SALES BaseToken**
+*   Allocated only at Commit
+*   No preview allocation
+*   No decrements
+
+#### B) `OrderSequenceCounter` (US‑006 complete)
+
+*   Tracks `NextSeq` per:
+        (Scope, BaseToken, QualifierCode, SystemLetter)
+*   Alternate key on the above
+*   `BaseToken` is **Text** (supports numeric SALES + PROJECT tokens like TAGO25)
+*   `NextSeq` explicitly initialized to `1` at create time (Flow‑enforced)
+*   No column defaults relied upon
+
+#### C) `AllocatedOrderNumber` (US‑007 complete)
+
+*   Ledger table: **one row per allocated order number**
+*   `OrderNumber` stored as Text
+*   `ParentOrder` = self‑lookup (supports backorders)
+*   Alternate key enforcing uniqueness on:
+        (Scope, BaseToken, QualifierCode, SystemLetter, SequenceNumber)
+*   Identity fields are **write‑once**; updates blocked server‑side
+
+#### D) Reference Tables (Governance)
+
+*   `Customer` (Code → Name, IsActive)
+*   `QualifierType` (2‑char codes, IsActive)
+*   `SystemLetterType` (Letter, Description, IsActive)
+*   Pattern: **reference table governs values; operational tables store scalar codes**
+
+***
+
+### 4) Allocation Lifecycle (Phase 1 = Power Automate)
+
+**Preview**
+
+*   Read‑only
+*   Computes candidate display only
+*   Reads counters but **never writes**
+
+**Commit**
+
+1.  Validate reference data
+2.  If SALES:
+    *   Allocate Sales BaseToken at Commit
+3.  Get or create `OrderSequenceCounter` row (NextSeq initialized to 1)
+4.  Allocate sequence safely:
+    *   Read NextSeq
+    *   Allocate
+    *   Update NextSeq + 1
+    *   Retry on conflict with hard stop
+5.  Write one row to `AllocatedOrderNumber`
+6.  For backorders: set `ParentOrder`
+7.  Ledger rows remain even if canceled
+
+***
+
+### 5) Immutability Enforcement
+
+*   Dataverse doesn’t provide true immutable columns
+*   Enforced via **Power Automate**:
+    *   On Update of `AllocatedOrderNumber`, block changes to:
+            OrderNumber, Scope, BaseToken,
+            QualifierCode, SystemLetter, SequenceNumber
+*   Canvas App displays identity fields read‑only
+
+***
+
+### 6) Canvas App — What Exists So Far (US‑008A COMPLETE)
+
+**App**
+
+*   Canvas App inside solution **Q‑1019 Logbook**
+*   Tablet layout
+
+#### Screen 1: `scrOrderType` (Access `dlgNewOrderType` clone)
+
+*   Two large buttons:
+    *   **Sales Order**
+    *   **Project Order**
+*   When Project selected:
+    *   Searchable project selector (temporary in‑app list)
+    *   Current tokens:
+            TAGO25, TIFOPC, OPC005, OPC006,
+            FRC068, EMS002, EMS003, TAO214, ATLAS32
+*   Cancel exits app
+
+#### Screen 2: `scrGenerate` (Access “Generate Q‑1019 Numbers” clone)
+
+**Left Section**
+
+*   Order Type (label)
+*   Order Base:
+    *   SALES → “preview shows next”
+    *   PROJECT → selected project token
+*   System Letter (searchable ComboBox, governed)
+*   Customer (searchable ComboBox, governed)
+*   Customer Name (display)
+*   PO #
+*   Date Received
+
+**Qualifier Selection (Modern UX)**
+
+*   Search box
+*   Gallery of active qualifiers
+*   Each row:
+    *   QualifierCode
+    *   Description
+    *   Quantity input
+*   Quantities tracked in `colQualQty`
+*   No free‑text qualifier entry (no fat‑fingering)
+
+**Right‑Side Buttons**
+
+*   Cancel
+*   Reset Qty
+*   Preview Numbers (stubbed)
+*   Commit Batch (stubbed)
+
+**Preview Output**
+
+*   Multiline, read‑only text area
+*   One order number per line
+*   Vertical scroll
+*   Disclaimer always visible:
+    > “Preview only. Order numbers shown are not reserved. Final allocation occurs only at Commit and may differ under concurrency.”
+
+***
+
+### 7) Preview Behavior (Locked)
+
+*   Preview outputs **N rows per qualifier**, where N = Quantity
+*   Preview is **non‑allocating**
+*   Sequence candidates may repeat (expected)
+*   No counters or ledgers touched
+
+***
+
+### 8) Current State
+
+*   ✅ US‑006 complete
+*   ✅ US‑007 complete
+*   ✅ US‑008A (Canvas App UI) complete
+*   ⏭️ Next execution step: **US‑008B — Preview Flow (Non‑Allocating)**
+
+Preview Flow responsibilities:
+
+*   Accept Qualifiers + quantities
+*   Read counters only
+*   Expand N rows per qualifier
+*   Return preview lines for text‑area display
+*   No writes
+
+***
+
+**Mode Requested:**  
+Implementation mode.  
+No redesign.  
+Ask clarifying questions only if strictly required to wire behavior.
+
+***
+
+If you want, next I can also give you:
+
+*   a **short “delta prompt”** you can paste mid‑conversation when context starts to thin, or
+*   a **US‑008B context prompt** specifically for building the Preview Power Automate flow.
+
+Just say which.
