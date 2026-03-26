@@ -1,0 +1,71 @@
+# US-008C_Commit_Allocate — One-Page Runbook, Sequence Diagram & Change Log
+
+## One-Page Runbook
+
+### Purpose
+This flow is the system of record for allocating immutable SALES and PROJECT order numbers during commit operations. Preview operations must never allocate.
+
+### Quick Triage Checklist
+1. **Identify Scope**
+   - Check `vScopeLabel` (`SALES` or `PROJECT`).
+   - If `PROJECT`, verify SALES BaseTokenCounter scopes were skipped.
+
+2. **SALES Allocation Issues**
+   - Confirm exactly one row exists in `SalesBaseTokenCounters`.
+   - If HTTP PATCH failed:
+     - `204` = success
+     - `412` = ETag contention (expected under concurrency)
+     - `429` = throttling (retry/backoff)
+   - Verify `vReserved = true` and `vSbtReservedToken` populated.
+
+3. **PROJECT Allocation Issues**
+   - Validate `ProjectCode` (six alphanumeric characters).
+   - Ensure Order Sequence Counter exists for Project × Qualifier × System.
+
+4. **Sequence / Formatting Errors**
+   - `Seq` must be zero-padded to 3 digits (`001`).
+   - `BackorderNo` must be zero-padded to 2 digits (`00`).
+   - Final format: `<BaseToken>-<Qualifier><System><Seq>-<BackorderNo>`.
+
+5. **Common Failure Modes**
+   - No SALES BaseTokenCounter row → Flow terminates (by design).
+   - Duplicate SALES BaseTokenCounter rows → Warning logged, first row used.
+   - Max retries exceeded → Allocation fails safely, no token lost.
+
+---
+
+## Sequence Diagram (Conceptual)
+
+```text
+Power Apps
+   |
+   | Commit Request (Scope, Qualifiers, System, BO)
+   v
+US-008C_Commit_Allocate Flow
+   |
+   |--[Scope = SALES]-------------------------------|
+   |   List SALES BaseTokenCounter                  |
+   |   |                                           |
+   |   |--HTTP PATCH (If-Match/ETag)-------------->|
+   |   |<--204 / 412 / 429--------------------------|
+   |   |   Retry until reserved or max tries        |
+   |                                               |
+   |--[Scope = PROJECT]-----------------------------|
+   |   Derive BaseToken from ProjectCode            |
+   |
+   | Parse Qualifiers JSON
+   | For each Qualifier/System:
+   |   Ensure Order Sequence Counter exists
+   |   Increment / Resolve Seq
+   |
+   | Compose Final Order Number
+   v
+Power Apps (Response)
+```
+
+---
+
+## Change-Log Synopsis Entry
+
+**US-008C — Commit-Time Allocation of SALES and PROJECT Order Numbers**  Implemented concurrency-safe commit logic for allocating immutable order numbers. SALES orders now reserve a global numeric base token using optimistic locking, while PROJECT orders derive stable base tokens from project codes and sequence only within qualifier/system contexts. Enforced canonical order number format and documented scope routing to prevent cross-scope side effects.
+
